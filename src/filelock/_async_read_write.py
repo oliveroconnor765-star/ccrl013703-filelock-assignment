@@ -101,6 +101,32 @@ class AsyncReadWriteLock:
         loop = self._loop or asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, functools.partial(func, *args, **kwargs))
 
+    def _schedule_release_if_acquired(self, cf_future: futures.Future[object]) -> None:
+        """
+        Schedule a release if an acquire operation completes successfully after cancellation.
+
+        When an acquire is cancelled but the executor thread continues and succeeds, the lock would be leaked.
+        This callback ensures the lock is released in such cases.
+
+        :param cf_future: the concurrent.futures.Future from the acquire operation
+
+        """
+
+        def _on_done(fut: futures.Future[object]) -> None:
+            try:
+                fut.result()
+            except Exception:  # noqa: BLE001
+                # Acquire failed (timeout, error, or cancellation) - nothing to clean up
+                return
+            # Acquire succeeded after cancellation - release to avoid leak
+            try:
+                self._executor.submit(self._lock.release)
+            except RuntimeError:
+                # Executor shut down
+                pass
+
+        cf_future.add_done_callback(_on_done)
+
     async def acquire_read(self, timeout: float = -1, *, blocking: bool = True) -> AsyncAcquireReadWriteReturnProxy:
         """
         Acquire a shared read lock.
@@ -116,7 +142,12 @@ class AsyncReadWriteLock:
         :raises Timeout: if the lock cannot be acquired within *timeout* seconds
 
         """
-        await self._run(self._lock.acquire_read, timeout, blocking=blocking)
+        cf_future = self._executor.submit(self._lock.acquire_read, timeout, blocking=blocking)
+        try:
+            await asyncio.wrap_future(cf_future)
+        except asyncio.CancelledError:
+            self._schedule_release_if_acquired(cf_future)
+            raise
         return AsyncAcquireReadWriteReturnProxy(lock=self)
 
     async def acquire_write(self, timeout: float = -1, *, blocking: bool = True) -> AsyncAcquireReadWriteReturnProxy:
@@ -134,7 +165,12 @@ class AsyncReadWriteLock:
         :raises Timeout: if the lock cannot be acquired within *timeout* seconds
 
         """
-        await self._run(self._lock.acquire_write, timeout, blocking=blocking)
+        cf_future = self._executor.submit(self._lock.acquire_write, timeout, blocking=blocking)
+        try:
+            await asyncio.wrap_future(cf_future)
+        except asyncio.CancelledError:
+            self._schedule_release_if_acquired(cf_future)
+            raise
         return AsyncAcquireReadWriteReturnProxy(lock=self)
 
     async def release(self, *, force: bool = False) -> None:
