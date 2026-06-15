@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from concurrent.futures import ThreadPoolExecutor
+import logging
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
     from concurrent import futures
     from types import TracebackType
+
+_LOGGER = logging.getLogger("filelock")
 
 
 class AsyncAcquireReadWriteReturnProxy:
@@ -101,6 +104,37 @@ class AsyncReadWriteLock:
         loop = self._loop or asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, functools.partial(func, *args, **kwargs))
 
+    def _release_on_cancel(self, fut: Future[object]) -> None:
+        """Done-callback for a cancelled acquire: release the lock if the executor completed it."""
+        if fut.cancelled() or fut.exception() is not None:
+            return
+        try:
+            self._lock.release()
+        except Exception:
+            _LOGGER.debug("suppressed error while releasing lock after cancellation", exc_info=True)
+
+    async def _run_acquire(
+        self, acquire_fn: Callable[..., object], timeout: float, *, blocking: bool
+    ) -> AsyncAcquireReadWriteReturnProxy:
+        """
+        Submit *acquire_fn* to the executor and handle asyncio cancellation.
+
+        If the awaiting task is cancelled while the executor thread is still blocking on the
+        underlying SQLite lock, the executor thread may complete the acquisition *after* the
+        ``CancelledError`` has already been raised to the caller.  To prevent the abandoned
+        acquire from leaking lock ownership, a done-callback is registered on the underlying
+        :class:`~concurrent.futures.Future` so that a successful-but-orphaned acquisition is
+        immediately released.
+        """
+        loop = self._loop or asyncio.get_running_loop()
+        cf: Future[object] = self._executor.submit(functools.partial(acquire_fn, timeout, blocking=blocking))
+        try:
+            await asyncio.wrap_future(cf, loop=loop)
+        except asyncio.CancelledError:
+            cf.add_done_callback(self._release_on_cancel)
+            raise
+        return AsyncAcquireReadWriteReturnProxy(lock=self)
+
     async def acquire_read(self, timeout: float = -1, *, blocking: bool = True) -> AsyncAcquireReadWriteReturnProxy:
         """
         Acquire a shared read lock.
@@ -116,8 +150,7 @@ class AsyncReadWriteLock:
         :raises Timeout: if the lock cannot be acquired within *timeout* seconds
 
         """
-        await self._run(self._lock.acquire_read, timeout, blocking=blocking)
-        return AsyncAcquireReadWriteReturnProxy(lock=self)
+        return await self._run_acquire(self._lock.acquire_read, timeout, blocking=blocking)
 
     async def acquire_write(self, timeout: float = -1, *, blocking: bool = True) -> AsyncAcquireReadWriteReturnProxy:
         """
@@ -134,8 +167,7 @@ class AsyncReadWriteLock:
         :raises Timeout: if the lock cannot be acquired within *timeout* seconds
 
         """
-        await self._run(self._lock.acquire_write, timeout, blocking=blocking)
-        return AsyncAcquireReadWriteReturnProxy(lock=self)
+        return await self._run_acquire(self._lock.acquire_write, timeout, blocking=blocking)
 
     async def release(self, *, force: bool = False) -> None:
         """
